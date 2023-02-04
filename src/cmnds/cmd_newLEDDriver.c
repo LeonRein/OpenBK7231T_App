@@ -300,45 +300,67 @@ void LED_RunQuickColorLerp(int deltaMS) {
 
 int led_gamma_enable_channel_messages = 0;
 
-float led_gamma_correction (int color, float iVal) { // apply LED gamma and RGB correction
-	if ((color < 0) || (color > 4)) {
-		return iVal;
-	}
-
-	// apply LED gamma correction:
-	float ch_bright_min = g_cfg.led_corr.rgb_bright_min / 100;
-	if (color > 2) {
-		ch_bright_min = g_cfg.led_corr.cw_bright_min / 100;
-	}
-	float brightnessNormalized0to1 = g_brightness0to100 * 0.01f;
-	float oVal = (powf (brightnessNormalized0to1, g_cfg.led_corr.led_gamma) * (1 - ch_bright_min) + ch_bright_min) * iVal;
-
-	// apply RGB level correction:
-	if (color < 3) {
-		rgb_used_corr[color] = g_cfg.led_corr.rgb_cal[color];
-		// boost gain to get full brightness when one RGB base color is dominant:
-		float sum_other_colors = baseColors[0] + baseColors[1] + baseColors[2] - baseColors[color];
-		if (baseColors[color] > sum_other_colors) {
-			rgb_used_corr[color] += (1.0f - rgb_used_corr[color]) * (1.0f - sum_other_colors / baseColors[color]);
+float led_gamma_correction (int maxPossibleIndexToSet) { // apply LED gamma and RGB correction
+	for(int color = 0; color < maxPossibleIndexToSet; color++) {
+		// apply LED gamma correction:
+		float ch_bright_min = g_cfg.led_corr.rgb_bright_min / 100.0f;
+		if (color > 2) {
+			ch_bright_min = g_cfg.led_corr.cw_bright_min / 100.0f;
 		}
-		oVal *= rgb_used_corr[color];
+		float brightnessNormalized0to1 = g_brightness0to100 * 0.01f;
+		finalColors[color] = (powf (brightnessNormalized0to1, g_cfg.led_corr.led_gamma) * (1 - ch_bright_min) + ch_bright_min) * baseColors[color];
+
+		// apply RGB level correction:
+		if (color < 3) {
+			rgb_used_corr[color] = g_cfg.led_corr.rgb_cal[color];
+			// boost gain to get full brightness when one RGB base color is dominant:
+			float sum_other_colors = baseColors[0] + baseColors[1] + baseColors[2] - baseColors[color];
+			if (baseColors[color] > sum_other_colors) {
+				rgb_used_corr[color] += (1.0f - rgb_used_corr[color]) * (1.0f - sum_other_colors / baseColors[color]);
+			}
+			finalColors[color] *= rgb_used_corr[color];
+		}
+
+		if (led_gamma_enable_channel_messages &&
+				(((g_lightMode == Light_RGB) && (color < 3)) || ((g_lightMode != Light_RGB) && (color >= 3)))) {
+			addLogAdv (LOG_INFO, LOG_FEATURE_CMD, "channel %i set to %.2f%%\r\n", color, finalColors[color] / 2.55);
+		}
+		if (finalColors[color] > 255.0f) {
+			finalColors[color] = 255.0f;
+		}
 	}
 
-	if (led_gamma_enable_channel_messages &&
-			(((g_lightMode == Light_RGB) && (color < 3)) || ((g_lightMode != Light_RGB) && (color >= 3)))) {
-		addLogAdv (LOG_INFO, LOG_FEATURE_CMD, "channel %i set to %.2f%%\r\n", color, oVal / 2.55);
+	// in case of every gamma corrected color is below ch_bright_min, set brightest color to ch_bright_min
+
+	float max_rgb = max(max(finalColors[0], finalColors[1]), finalColors[2]);
+	float max_cw = max(finalColors[3], finalColors[4]);
+
+	for(int color = 0; color < maxPossibleIndexToSet; color++) {
+		if (color > 2 && max_cw != 0.0f) {
+			float ch_bright_min = g_cfg.led_corr.cw_bright_min / 100.0f * 255.0f;
+			if ( max_cw < ch_bright_min && finalColors[color] == max_cw) {
+				finalColors[color] = ch_bright_min;
+			}
+			else if (finalColors[color] < ch_bright_min) {
+				finalColors[color] = 0.0f;
+			}
+		}
+		else if (max_rgb != 0.0f) {
+			float ch_bright_min = g_cfg.led_corr.rgb_bright_min / 100.0f * 255.0f;
+			if ( max_rgb < ch_bright_min && finalColors[color] == max_rgb) {
+				finalColors[color] = ch_bright_min;
+			}
+			else if (finalColors[color] < ch_bright_min) {
+				finalColors[color] = 0.0f;
+			}
+		}
 	}
-	if (oVal > 255.0f) {
-		oVal = 255.0f;
-	}
-	return oVal;
 } //
 
 void apply_smart_light() {
 	int i;
 	int firstChannelIndex;
 	int channelToUse;
-	byte finalRGBCW[5];
 	byte baseRGBCW[5];
 	int maxPossibleIndexToSet;
 	int emulatedCool = -1;
@@ -379,13 +401,11 @@ void apply_smart_light() {
 		for(i = 0; i < 5; i++) {
 			finalColors[i] = 0;
 			baseRGBCW[i] = 0;
-			finalRGBCW[i] = 0;
 		}
 		if(g_lightEnableAll) {
 			float brightnessNormalized0to1 = g_brightness0to100 * 0.01f;
 			for(i = 3; i < 5; i++) {
 				finalColors[i] = baseColors[i] * brightnessNormalized0to1;
-				finalRGBCW[i] = baseColors[i] * brightnessNormalized0to1;
 				baseRGBCW[i] = baseColors[i];
 			}
 		}
@@ -394,12 +414,12 @@ void apply_smart_light() {
 			CHANNEL_Set_FloatPWM(firstChannelIndex+1, value_brightness, CHANNEL_SET_FLAG_SKIP_MQTT | CHANNEL_SET_FLAG_SILENT);
 		}
 	} else {
-		for(i = 0; i < maxPossibleIndexToSet; i++) {
-			float final = 0.0f;
+		led_gamma_correction(maxPossibleIndexToSet);
 
+		for(i = 0; i < maxPossibleIndexToSet; i++) {
 			baseRGBCW[i] = baseColors[i];
-			if(g_lightEnableAll) {
-				final = led_gamma_correction (i, baseColors[i]);
+			if(!g_lightEnableAll) {
+				finalColors[i] = 0.0f;
 			}
 			if(g_lightMode == Light_Temperature) {
 				// skip channels 0, 1, 2
@@ -407,22 +427,18 @@ void apply_smart_light() {
 				if(i < 3)
 				{
 					baseRGBCW[i] = 0;
-					final = 0;
+					finalColors[i]  = 0;
 				}
 			} else if(g_lightMode == Light_RGB) {
 				// skip channels 3, 4
 				if(i >= 3)
 				{
 					baseRGBCW[i] = 0;
-					final = 0;
+					finalColors[i]  = 0;
 				}
-			} else {
-
-			}
-			finalColors[i] = final;
-			finalRGBCW[i] = final;
+			} 
 			
-			float chVal = final * g_cfg_colorScaleToChannel;
+			float chVal = finalColors[i]  * g_cfg_colorScaleToChannel;
 			if (chVal > 100.0f)
 				chVal = 100.0f;
 
